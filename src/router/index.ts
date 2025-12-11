@@ -29,7 +29,7 @@ const routes: Array<RouteRecordRaw> = [
 ]
 
 const router = createRouter({
-    history: createWebHistory('/Tetris/'),
+    history: createWebHistory('/Tetris-frontend/'),
     routes
 })
 
