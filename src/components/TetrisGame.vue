@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
+import { submitScore } from '@/api/request';
 
 const router = useRouter();
 
@@ -55,6 +56,13 @@ let lastTime = 0;
 let dropAccum = 0;
 let animationId: number;
 let durationTimer: any = null; // [新增] 計時器 ID
+
+// --- 持續按鍵檢測 ---
+const keysPressed = new Set<string>();
+let moveAccum = 0;
+let moveDelay = 100; // 橫移延遲（毫秒）
+let fastMoveDelay = 50; // 快速橫移延遲
+let initialMoveDelay = 150; // 初始延遲
 
 // --- Helper Functions ---
 const randomPiece = (): Piece => {
@@ -235,6 +243,24 @@ const update = (time: number) => {
   const dt = time - lastTime;
   lastTime = time;
   dropAccum += dt;
+  moveAccum += dt;
+
+  // 處理持續按鍵移動
+  if (moveAccum > moveDelay) {
+    if (keysPressed.has('ArrowLeft')) {
+      if (!collides(grid, current, -1, 0)) current.x--;
+    }
+    if (keysPressed.has('ArrowRight')) {
+      if (!collides(grid, current, 1, 0)) current.x++;
+    }
+    if (keysPressed.has('ArrowDown')) {
+      if (!collides(grid, current, 0, 1)) {
+        current.y++;
+        score.value += 1;
+      }
+    }
+    moveAccum = 0;
+  }
 
   if (dropAccum > dropInterval) {
     if (!collides(grid, current, 0, 1)) {
@@ -255,31 +281,74 @@ const gameOver = async () => {
   draw(); 
   
   try {
-    // 上傳包含 duration 的數據
-    console.log(`Game Over! Score: ${score.value}, Duration: ${duration.value}s`);
+    // 上傳分數到後端
+    await submitScore({
+      score: score.value,
+      level: level.value,
+      duration: duration.value
+    });
     
+    console.log('分數已成功上傳到後端');
+    
+    // 同時保存到本地作為備份
     const localRec = JSON.parse(localStorage.getItem('tetris_local_records') || '[]');
     localRec.push({ 
       name: localStorage.getItem('username') || 'Player', 
       score: score.value,
-      duration: duration.value // [新增] 紀錄時長
+      level: level.value,
+      duration: duration.value
     });
     localRec.sort((a:any, b:any) => b.score - a.score);
     localStorage.setItem('tetris_local_records', JSON.stringify(localRec));
-  } catch (e) { console.error(e); }
+  } catch (error: any) {
+    console.error('上傳分數失敗:', error);
+    
+    // 如果上傳失敗（例如網路問題或未登入），仍保存到本地
+    const localRec = JSON.parse(localStorage.getItem('tetris_local_records') || '[]');
+    localRec.push({ 
+      name: localStorage.getItem('username') || 'Player', 
+      score: score.value,
+      level: level.value,
+      duration: duration.value
+    });
+    localRec.sort((a:any, b:any) => b.score - a.score);
+    localStorage.setItem('tetris_local_records', JSON.stringify(localRec));
+    
+    // 如果是因為未登入導致失敗，可以提示用戶
+    if (error.response?.status === 401 || error.response?.status === 403) {
+      console.warn('未登入或 Token 已過期，分數僅保存在本地');
+    }
+  }
 };
 
 // --- Input Handling ---
 const handleKeydown = (e: KeyboardEvent) => {
+  // 防止方向鍵和空白鍵造成頁面捲動
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+    e.preventDefault();
+  }
+  
   if (isGameOver.value || isPaused.value || showCountDown.value) return;
+  
+  // 避免重複觸發
+  if (e.repeat && (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowDown')) return;
 
+  // 方向鍵：加入持續按鍵集合並立即執行一次
   if (e.key === 'ArrowLeft') {
+    keysPressed.add('ArrowLeft');
     if (!collides(grid, current, -1, 0)) current.x--;
+    moveAccum = 0; // 重置移動累積
   } else if (e.key === 'ArrowRight') {
+    keysPressed.add('ArrowRight');
     if (!collides(grid, current, 1, 0)) current.x++;
+    moveAccum = 0;
   } else if (e.key === 'ArrowDown') {
-    if (!collides(grid, current, 0, 1)) current.y++;
-    score.value += 1; 
+    keysPressed.add('ArrowDown');
+    if (!collides(grid, current, 0, 1)) {
+      current.y++;
+      score.value += 1;
+    }
+    moveAccum = 0;
   } else if (e.key === 'ArrowUp') {
     const variants = SHAPES[current.type];
     if (variants && variants.length > 0) {
@@ -321,6 +390,13 @@ const handleKeydown = (e: KeyboardEvent) => {
     }
   }
   draw();
+};
+
+const handleKeyup = (e: KeyboardEvent) => {
+  // 移除持續按鍵
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+    keysPressed.delete(e.key);
+  }
 };
 
 const pauseGame = () => {
@@ -384,10 +460,12 @@ const initGame = () => {
 onMounted(() => {
   initGame();
   window.addEventListener('keydown', handleKeydown);
+  window.addEventListener('keyup', handleKeyup);
 });
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeydown);
+  window.removeEventListener('keyup', handleKeyup);
   cancelAnimationFrame(animationId);
   stopDurationTimer(); // [新增] 組件卸載時清除計時器
 });
@@ -401,122 +479,529 @@ onUnmounted(() => {
     <!-- HUD 資訊面板 -->
     <div class="hud">
       <div class="hud-panel small-panel">
-        <span class="label">HOLD (C)</span>
+        <span class="label">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 2v4"></path>
+            <path d="M15 2v4"></path>
+            <rect x="3" y="4" width="18" height="18" rx="2"></rect>
+            <path d="M3 10h18"></path>
+          </svg>
+          HOLD (C)
+        </span>
         <canvas ref="holdCanvas" width="80" height="60"></canvas>
       </div>
       
       <div class="hud-panel info-panel">
-        <div>
-          <div class="label">SCORE</div>
-          <div class="value">{{ score }}</div>
+        <div class="info-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+          </svg>
+          <div>
+            <div class="label">SCORE</div>
+            <div class="value">{{ score.toLocaleString() }}</div>
+          </div>
         </div>
-        <div>
-          <div class="label">LEVEL</div>
-          <div class="value">{{ level }}</div>
+        
+        <div class="info-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"></circle>
+            <path d="M12 6v6l4 2"></path>
+          </svg>
+          <div>
+            <div class="label">TIME</div>
+            <div class="value">{{ duration }}s</div>
+          </div>
         </div>
-        <!-- [新增] 時間顯示區塊 -->
-        <div>
-          <div class="label">TIME</div>
-          <div class="value">{{ duration }}s</div>
+        
+        <div class="info-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="m16 3 4 4-4 4"></path>
+            <path d="M20 7H4"></path>
+            <path d="m8 21-4-4 4-4"></path>
+            <path d="M4 17h16"></path>
+          </svg>
+          <div>
+            <div class="label">LEVEL</div>
+            <div class="value">{{ level }}</div>
+          </div>
         </div>
-        <div>
-          <div class="label">LINES</div>
-          <div class="value">{{ lines }}</div>
+        
+        <div class="info-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="4" y1="9" x2="20" y2="9"></line>
+            <line x1="4" y1="15" x2="20" y2="15"></line>
+            <line x1="10" y1="3" x2="8" y2="21"></line>
+            <line x1="16" y1="3" x2="14" y2="21"></line>
+          </svg>
+          <div>
+            <div class="label">LINES</div>
+            <div class="value">{{ lines }}</div>
+          </div>
         </div>
       </div>
 
       <div class="hud-panel small-panel">
-        <span class="label">NEXT</span>
+        <span class="label">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M5 12h14"></path>
+            <path d="m12 5 7 7-7 7"></path>
+          </svg>
+          NEXT
+        </span>
         <canvas ref="nextCanvas" width="80" height="60"></canvas>
       </div>
 
       <div class="controls">
-        <button v-if="isGameOver" @click="initGame" class="primary-btn">再玩一次</button>
-        <button v-else-if="isPaused" @click="resumeGame" class="secondary-btn">繼續</button>
-        <!-- [修改] 這裡改用 pauseGame 函數來確保計時器停止 -->
-        <button v-else @click="pauseGame" class="secondary-btn">暫停</button>
-        <button @click="router.back()" class="secondary-btn" style="margin-top:5px;">離開</button>
+        <button v-if="isGameOver" @click="initGame" class="primary-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"></path>
+          </svg>
+          再玩一次
+        </button>
+        <button v-else-if="isPaused" @click="resumeGame" class="secondary-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+          </svg>
+          繼續
+        </button>
+        <button v-else @click="pauseGame" class="secondary-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="6" y="4" width="4" height="16"></rect>
+            <rect x="14" y="4" width="4" height="16"></rect>
+          </svg>
+          暫停
+        </button>
+        <button @click="router.push('/lobby')" class="secondary-btn exit-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+            <polyline points="16 17 21 12 16 7"></polyline>
+            <line x1="21" y1="12" x2="9" y2="12"></line>
+          </svg>
+          離開
+        </button>
       </div>
     </div>
 
     <!-- 倒數遮罩 -->
     <div v-if="showCountDown" class="overlay">
-      <h1 class="count-text">{{ countDown }}</h1>
+      <div class="countdown-circle">
+        <span class="count-text">{{ countDown }}</span>
+      </div>
     </div>
 
     <!-- 遊戲結束遮罩 -->
-    <div v-if="isGameOver" class="overlay glass-card" style="width: auto; height: auto;">
-      <h2>GAME OVER</h2>
-      <p>Score: {{ score }}</p>
-      <p>Time: {{ duration }}s</p> <!-- [新增] 結束畫面顯示時間 -->
-      <button @click="initGame" class="primary-btn">重試</button>
-      <button @click="router.push('/leaderboard')" class="secondary-btn" style="margin-top:10px;">排行榜</button>
+    <div v-if="isGameOver" class="overlay">
+      <div class="game-over-panel">
+        <svg class="game-over-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+          <line x1="12" y1="9" x2="12" y2="13"></line>
+          <line x1="12" y1="17" x2="12.01" y2="17"></line>
+        </svg>
+        <h2 class="game-over-title">GAME OVER</h2>
+        <div class="game-over-stats">
+          <div class="stat-item">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+            </svg>
+            <div>
+              <span class="stat-label">SCORE</span>
+              <span class="stat-value">{{ score.toLocaleString() }}</span>
+            </div>
+          </div>
+          <div class="stat-item">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <path d="M12 6v6l4 2"></path>
+            </svg>
+            <div>
+              <span class="stat-label">TIME</span>
+              <span class="stat-value">{{ duration }}s</span>
+            </div>
+          </div>
+        </div>
+        <div class="game-over-actions">
+          <button @click="initGame" class="primary-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"></path>
+            </svg>
+            重試
+          </button>
+          <button @click="router.push('/leaderboard')" class="secondary-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"></path>
+              <path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"></path>
+              <path d="M4 22h16"></path>
+              <path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"></path>
+              <path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"></path>
+              <path d="M18 2H6v7a6 6 0 0 0 12 0V2Z"></path>
+            </svg>
+            排行榜
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
 .game-wrapper {
+  min-height: 100vh;
   display: flex;
   flex-direction: row;
-  gap: 20px;
-  align-items: flex-start;
-  padding: 20px;
+  gap: 2rem;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
 }
 
 .main-board {
-  width: 300px; /* 顯示寬度 */
-  height: 600px; /* 顯示高度 */
-  background: var(--cell-0);
-  border-radius: 10px;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-  border: 1px solid var(--glass-border);
+  width: 300px;
+  height: 600px;
+  background: rgba(10, 14, 20, 0.8);
+  border-radius: 1rem;
+  box-shadow: 
+    0 0 0 1px rgba(255, 107, 53, 0.2),
+    0 20px 50px rgba(0, 0, 0, 0.5),
+    0 0 80px rgba(255, 107, 53, 0.15);
+  border: 1px solid rgba(255, 107, 53, 0.3);
 }
 
 .hud {
   display: flex;
   flex-direction: column;
-  gap: 15px;
-  width: 120px;
+  gap: 1rem;
+  width: 160px;
 }
 
 .hud-panel {
-  background: var(--panel);
-  border: 1px solid var(--glass-border);
-  border-radius: 8px;
-  padding: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 0.75rem;
+  padding: 1rem;
   text-align: center;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  transition: all 0.3s ease;
 }
 
-.info-panel { gap: 10px; }
-.label { font-size: 10px; color: var(--muted); font-weight: 700; margin-bottom: 2px; }
-.value { font-size: 18px; color: #fff; font-weight: 700; }
+.hud-panel:hover {
+  background: rgba(255, 107, 53, 0.05);
+  border-color: rgba(255, 107, 53, 0.2);
+}
+
+.small-panel {
+  padding: 0.75rem;
+}
+
+.small-panel .label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.7rem;
+  color: rgba(255, 255, 255, 0.4);
+  font-weight: 700;
+  margin-bottom: 0.75rem;
+  letter-spacing: 1.5px;
+}
+
+.small-panel .label svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 2.5;
+  color: var(--accent);
+}
+
+.small-panel canvas {
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 0.5rem;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.info-panel {
+  gap: 1rem;
+  padding: 1.25rem 1rem;
+}
+
+.info-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.info-item svg {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  color: var(--accent);
+  stroke-width: 2.5;
+}
+
+.info-item > div {
+  flex: 1;
+  text-align: left;
+}
+
+.label {
+  display: block;
+  font-size: 0.65rem;
+  color: rgba(255, 255, 255, 0.4);
+  font-weight: 700;
+  margin-bottom: 0.25rem;
+  letter-spacing: 1.5px;
+}
+
+.value {
+  font-size: 1.25rem;
+  color: #fff;
+  font-weight: 800;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.controls button {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+}
+
+.controls button svg {
+  width: 16px;
+  height: 16px;
+}
+
+.exit-btn {
+  margin-top: 0.5rem;
+}
 
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0,0,0,0.7);
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(10px);
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  z-index: 10;
+  z-index: 1000;
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.countdown-circle {
+  width: 180px;
+  height: 180px;
+  border-radius: 50%;
+  background: rgba(255, 107, 53, 0.1);
+  border: 4px solid var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 
+    0 0 60px rgba(255, 107, 53, 0.4),
+    inset 0 0 40px rgba(255, 107, 53, 0.1);
+  animation: pulse 1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 
+      0 0 60px rgba(255, 107, 53, 0.4),
+      inset 0 0 40px rgba(255, 107, 53, 0.1);
+  }
+  50% {
+    transform: scale(1.05);
+    box-shadow: 
+      0 0 80px rgba(255, 107, 53, 0.6),
+      inset 0 0 60px rgba(255, 107, 53, 0.2);
+  }
 }
 
 .count-text {
-  font-size: 100px;
-  color: var(--accent);
+  font-size: 5rem;
   font-weight: 900;
-  text-shadow: 0 0 20px var(--accent);
+  color: var(--accent);
+  text-shadow: 0 0 40px rgba(255, 107, 53, 0.8);
 }
 
-@media (max-width: 600px) {
-  .game-wrapper { flex-direction: column; align-items: center; }
-  .hud { flex-direction: row; width: 100%; justify-content: space-between; }
-  .main-board { width: 240px; height: 480px; }
+.game-over-panel {
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 1.5rem;
+  padding: 3rem 2.5rem;
+  max-width: 450px;
+  width: 90%;
+  text-align: center;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  animation: slideUp 0.4s ease;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(30px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.game-over-icon {
+  width: 80px;
+  height: 80px;
+  color: var(--accent);
+  margin: 0 auto 1.5rem;
+  filter: drop-shadow(0 0 20px rgba(255, 107, 53, 0.5));
+  animation: shake 0.5s ease;
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-10px); }
+  75% { transform: translateX(10px); }
+}
+
+.game-over-title {
+  font-size: 2.5rem;
+  font-weight: 900;
+  margin: 0 0 2rem 0;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  letter-spacing: 3px;
+}
+
+.game-over-stats {
+  display: flex;
+  gap: 2rem;
+  justify-content: center;
+  margin-bottom: 2rem;
+  padding: 1.5rem;
+  background: rgba(255, 107, 53, 0.05);
+  border-radius: 1rem;
+  border: 1px solid rgba(255, 107, 53, 0.1);
+}
+
+.stat-item {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.stat-item svg {
+  width: 32px;
+  height: 32px;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.stat-item > div {
+  text-align: left;
+}
+
+.stat-label {
+  display: block;
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.4);
+  font-weight: 700;
+  margin-bottom: 0.25rem;
+  letter-spacing: 1.5px;
+}
+
+.stat-value {
+  display: block;
+  font-size: 1.75rem;
+  font-weight: 800;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.game-over-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.game-over-actions button {
+  width: 100%;
+  padding: 1rem 1.5rem;
+  font-size: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+}
+
+.game-over-actions button svg {
+  width: 18px;
+  height: 18px;
+}
+
+@media (max-width: 768px) {
+  .game-wrapper {
+    flex-direction: column;
+    padding: 1rem;
+  }
+
+  .main-board {
+    width: 240px;
+    height: 480px;
+  }
+
+  .hud {
+    width: 100%;
+    max-width: 400px;
+  }
+
+  .info-panel {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+
+  .game-over-panel {
+    padding: 2rem 1.5rem;
+  }
+
+  .game-over-stats {
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .game-over-title {
+    font-size: 2rem;
+  }
+
+  .count-text {
+    font-size: 4rem;
+  }
+
+  .countdown-circle {
+    width: 150px;
+    height: 150px;
+  }
 }
 </style>
